@@ -274,6 +274,55 @@ def codegen_permute(ctx: LoweringContext, node: Node) -> object:
     )
 
 
+gather_lowering = register_lowering(
+    torch.ops.aten.gather.default,
+    masked_value_fn=None,  # Disable masked value computation to avoid ValueRanges issues
+)
+
+
+@gather_lowering.register_codegen("triton")
+def codegen_gather(ctx: LoweringContext, node: Node) -> object:
+    """Generate tl.gather for torch.gather operations."""
+    # Handle both positional and keyword arguments
+    # torch.gather(input, dim, index, *, sparse_grad=False)
+    tensor_arg = node.args[0] if len(node.args) > 0 else node.kwargs.get("input")
+    dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim")
+    index_arg = node.args[2] if len(node.args) > 2 else node.kwargs.get("index")
+
+    if tensor_arg is None:
+        raise ValueError("gather requires 'input' argument")
+    if dim is None:
+        raise ValueError("gather requires 'dim' argument")
+    if index_arg is None:
+        raise ValueError("gather requires 'index' argument")
+
+    # sparse_grad is allowed but ignored (only affects PyTorch autograd, not Triton codegen)
+    allowed_kwargs = {"input", "dim", "index", "sparse_grad"}
+    unknown_kwargs = set(node.kwargs.keys()) - allowed_kwargs
+    if unknown_kwargs:
+        raise ValueError(
+            f"gather kwargs not supported: {unknown_kwargs}. "
+            f"Only {allowed_kwargs} are allowed."
+        )
+
+    tensor = _env_arg(ctx, tensor_arg)
+    index = _env_arg(ctx, index_arg)
+    assert isinstance(tensor, ast.AST)
+    assert isinstance(index, ast.AST)
+
+    # Extract dim value - it might be a Node or an int
+    if isinstance(dim, Node):
+        dim = dim.meta["val"]
+    assert isinstance(dim, int), f"gather dim must be int, got {type(dim)}"
+
+    # Convert dim to axis for tl.gather (which uses axis parameter)
+    return expr_from_string(
+        f"tl.gather({{tensor}}, {{index}}.to(tl.int32), axis={dim})",
+        tensor=tensor,
+        index=index,
+    )
+
+
 stack_lowering = register_lowering(
     torch.ops.aten.stack.default,
     masked_value_fn=passthrough_masked_value,
